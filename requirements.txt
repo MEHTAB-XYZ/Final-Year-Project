@@ -1,0 +1,11 @@
+torch==2.1.0
+torchvision==0.16.0
+numpy==1.26.0
+pillow==10.0.1
+opencv-python==4.8.0.74
+streamlit==1.29.0
+tqdm==4.66.1
+matplotlib==3.8.0
+pytorch-grad-cam==1.4.6
+torchattacks==3.5.0
+scipy==1.11.3
