@@ -285,7 +285,7 @@ from metrics import confidence_drop, attack_success, robustness_score
 from physical_attacks import add_fog, add_brightness, add_rain
 
 # --- NEW IMPORTS FOR DIAGNOSIS ---
-from diagnosis import DiagnosisRunner
+from diagnosis import DiagnosisRunner, generate_pdf_report
 import torchvision.transforms as transforms
 
 # ---------------------------------------------------------------------
@@ -546,6 +546,10 @@ with tab_diagnosis:
     else:
         diag_files = st.file_uploader("Upload Test Images (Batch)", type=["jpg", "png"], accept_multiple_files=True, key="diag_up")
         
+        # Initialize session state for diagnosis results
+        if 'all_reports' not in st.session_state:
+            st.session_state.all_reports = None
+        
         if st.button("🚀 Run Diagnosis") and diag_files:
             runner = DiagnosisRunner(model)
             
@@ -572,6 +576,8 @@ with tab_diagnosis:
                     img_tensor = raw_transform(img_pil).unsqueeze(0) 
                     
                     report = runner.run_diagnosis(img_tensor, file.name)
+                    # Store clean tensor for later Grad-CAM analysis
+                    report['clean_tensor'] = img_tensor
                     all_reports.append(report)
                 except Exception as e:
                     st.error(f"Error processing {file.name}: {e}")
@@ -580,12 +586,25 @@ with tab_diagnosis:
             
             status_txt.text("Diagnosis Complete!")
             
+            # Store results in session state
+            st.session_state.all_reports = all_reports
+            
             if not all_reports:
                 st.stop()
 
-            # --- REPORTING ---
-            st.divider()
+        # --- REPORTING SECTION (uses session state) ---
+        # Display results if diagnosis has been run
+        if st.session_state.all_reports is not None and len(st.session_state.all_reports) > 0:
+            all_reports = st.session_state.all_reports
             
+            # ============================================================
+            # SECTION 1: MODEL ROBUSTNESS SUMMARY
+            # ============================================================
+            st.divider()
+            st.subheader("📊 Model Robustness Summary")
+            st.caption("Aggregate performance metrics across all tested attacks")
+            
+            # Calculate metrics
             total_score = 0
             total_attacks_count = 0 
             attack_performance = {}
@@ -598,40 +617,268 @@ with tab_diagnosis:
                         attack_performance[atk_name] = []
                     attack_performance[atk_name].append(data["score"])
             
-            # Robust Average Calculation
             avg_score = total_score / max(1, total_attacks_count)
-            
-            kpi1, kpi2, kpi3 = st.columns(3)
-            kpi1.metric("Overall Robustness", f"{avg_score:.1f}/100")
-            
             avg_atk_scores = {k: sum(v)/len(v) for k, v in attack_performance.items()}
             weakest = min(avg_atk_scores, key=avg_atk_scores.get)
             strongest = max(avg_atk_scores, key=avg_atk_scores.get)
             
-            kpi2.metric("Most Vulnerable To", weakest, f"{avg_atk_scores[weakest]:.1f}")
-            kpi3.metric("Strongest Against", strongest, f"{avg_atk_scores[strongest]:.1f}")
+            # Display KPIs with captions
+            kpi1, kpi2, kpi3 = st.columns(3)
+            with kpi1:
+                st.metric("Overall Robustness", f"{avg_score:.1f}/100")
+                st.caption("Average robustness across all attacks")
+            with kpi2:
+                st.metric("Most Vulnerable To", weakest, f"{avg_atk_scores[weakest]:.1f}")
+                st.caption("Lowest-scoring attack category")
+            with kpi3:
+                st.metric("Strongest Against", strongest, f"{avg_atk_scores[strongest]:.1f}")
+                st.caption("Highest-performing attack category")
             
-            st.subheader("Vulnerability Profile")
-            chart_data = pd.DataFrame.from_dict(avg_atk_scores, orient='index', columns=['Robustness Score'])
-            st.bar_chart(chart_data)
+            # ============================================================
+            # SECTION 2: ATTACK VULNERABILITY PROFILE
+            # ============================================================
+            st.divider()
+            st.subheader("🎯 Attack Vulnerability Profile")
+            st.caption("Comparative robustness scores by attack type (higher is better)")
             
-            st.subheader("📸 Failure Analysis")
+            # Sort attacks by score for better visualization
+            sorted_attacks = sorted(avg_atk_scores.items(), key=lambda x: x[1], reverse=True)
+            attack_names = [name for name, _ in sorted_attacks]
+            scores = [score for _, score in sorted_attacks]
+            
+            # Create color gradient (red for low scores, yellow for medium, green for high)
+            colors = []
+            for score in scores:
+                if score >= 80:
+                    colors.append('#2ecc71')  # Green
+                elif score >= 60:
+                    colors.append('#f39c12')  # Orange
+                elif score >= 40:
+                    colors.append('#e67e22')  # Dark Orange
+                else:
+                    colors.append('#e74c3c')  # Red
+            
+            # Create Plotly bar chart
+            import plotly.graph_objects as go
+            
+            fig = go.Figure(data=[
+                go.Bar(
+                    x=attack_names,
+                    y=scores,
+                    marker=dict(
+                        color=colors,
+                        line=dict(color='rgba(0,0,0,0.3)', width=1)
+                    ),
+                    text=[f'{s:.1f}' for s in scores],
+                    textposition='outside',
+                    textfont=dict(size=12, color='#2c3e50'),
+                    hovertemplate='<b>%{x}</b><br>Robustness Score: %{y:.1f}<extra></extra>'
+                )
+            ])
+            
+            fig.update_layout(
+                xaxis_title="Attack Type",
+                yaxis_title="Robustness Score",
+                yaxis=dict(range=[0, 105], gridcolor='rgba(0,0,0,0.1)'),
+                xaxis=dict(tickangle=-45),
+                plot_bgcolor='rgba(0,0,0,0)',
+                paper_bgcolor='rgba(0,0,0,0)',
+                height=400,
+                margin=dict(l=50, r=50, t=30, b=100),
+                font=dict(family="Arial, sans-serif", size=12, color='#2c3e50'),
+                hoverlabel=dict(
+                    bgcolor="white",
+                    font_size=13,
+                    font_family="Arial"
+                )
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            st.write("")  # Spacing
+            
+            # ============================================================
+            # SECTION 3: EXPORT & CONFIGURATION
+            # ============================================================
+            st.divider()
+            
+            # PDF Report Generation
+            col_pdf, col_xai = st.columns([2, 1])
+            
+            with col_pdf:
+                if st.button("📄 Generate & Download Model Health Report (PDF)", use_container_width=True):
+                    try:
+                        generate_pdf_report(all_reports)
+                        st.success("Model Health Report generated successfully.")
+                        
+                        pdf_path = "reports/model_health_report.pdf"
+                        if os.path.exists(pdf_path):
+                            with open(pdf_path, "rb") as pdf_file:
+                                st.download_button(
+                                    label="Download PDF Report",
+                                    data=pdf_file,
+                                    file_name="model_health_report.pdf",
+                                    mime="application/pdf",
+                                    use_container_width=True
+                                )
+                    except Exception as e:
+                        st.error(f"Error generating PDF: {e}")
+            
+            with col_xai:
+                show_xai = st.checkbox("Show Explainability Analysis", value=False)
+                st.caption("Enable Grad-CAM visualizations and retraining suggestions")
+            
+            # ============================================================
+            # SECTION 4: PER-IMAGE DIAGNOSIS & EXPLAINABILITY
+            # ============================================================
+            st.divider()
+            st.subheader("� Per-Image Diagnosis & Explainability")
+            st.caption(f"Detailed analysis for {len(all_reports)} tested images")
+            
+            st.write("")  # Spacing
+            
             for r in all_reports:
-                with st.expander(f"Report: {r['filename']} (Orig: {class_name(r['original_class'])})"):
+                with st.expander(f"**{r['filename']}** — Original: {class_name(r['original_class'])}", expanded=False):
                     
-                    # Robust Grid Layout (Modulo 4)
+                    # Attack Results Grid
+                    st.markdown("**Attack Test Results**")
                     cols = st.columns(4)
                     
                     for idx, (atk_name, data) in enumerate(r['attacks'].items()):
                         with cols[idx % 4]:
                             disp_img = data['adv_image'].transpose(1, 2, 0)
-                            
-                            # Safety Clip [0, 1] (Fixes white/black artifacts)
                             disp_img = np.clip(disp_img, 0.0, 1.0)
                             
                             st.image(disp_img, caption=f"{atk_name}\nScore: {data['score']}")
                             
                             if data['status'] == "Broken":
-                                st.caption(f"❌ Fail Lvl {data['severity']}")
+                                st.caption(f"❌ Failed at Level {data['severity']}")
                             else:
                                 st.caption("✅ Robust")
+                    
+                    st.write("")  # Spacing
+                    
+                    # ========================================================
+                    # EXPLAINABILITY SECTION (Only if enabled)
+                    # ========================================================
+                    if show_xai:
+                        st.divider()
+                        st.markdown("### Explainability Analysis")
+                        
+                        # Attack Selection
+                        available_attacks = list(r['attacks'].keys())
+                        selected_attack = st.selectbox(
+                            "Select attack to analyze:",
+                            available_attacks,
+                            key=f"attack_select_{r['filename']}"
+                        )
+                        
+                        if selected_attack:
+                            atk_data = r['attacks'][selected_attack]
+                            
+                            # Grad-CAM Visualization
+                            st.markdown("**Model Attention Comparison**")
+                            
+                            try:
+                                device = next(model.parameters()).device
+                                clean_tensor = r.get('clean_tensor')
+                                
+                                if clean_tensor is not None:
+                                    clean_tensor = clean_tensor.to(device)
+                                
+                                adv_tensor = torch.tensor(atk_data['adv_image']).unsqueeze(0).float().to(device)
+                                
+                                if clean_tensor is not None:
+                                    cam_clean = gradcam_visualization(model, clean_tensor)
+                                    cam_adv = gradcam_visualization(model, adv_tensor)
+                                    
+                                    # Side-by-side Grad-CAM
+                                    col_cam1, col_cam2 = st.columns(2)
+                                    with col_cam1:
+                                        st.image(cam_clean, use_column_width=True)
+                                        st.caption("Model Attention (Clean Input)")
+                                    with col_cam2:
+                                        st.image(cam_adv, use_column_width=True)
+                                        st.caption(f"Model Attention (After {selected_attack})")
+                                    
+                                    st.write("")  # Spacing
+                                    
+                                    # Attack Status
+                                    if atk_data['status'] == "Broken":
+                                        st.error(f"Attack **{selected_attack}** broke the model at severity level {atk_data['severity']}")
+                                    else:
+                                        st.success(f"Model remained robust against **{selected_attack}**")
+                                    
+                                    # CAM Metrics
+                                    if 'cam_drift' in atk_data and 'cam_focus' in atk_data and 'cam_entropy' in atk_data:
+                                        st.markdown("**Attention Metrics**")
+                                        met_col1, met_col2, met_col3 = st.columns(3)
+                                        with met_col1:
+                                            st.metric("CAM Drift", f"{atk_data['cam_drift']:.3f}")
+                                            st.caption("Attention shift magnitude")
+                                        with met_col2:
+                                            st.metric("CAM Focus", f"{atk_data['cam_focus']:.3f}")
+                                            st.caption("Attention concentration")
+                                        with met_col3:
+                                            st.metric("CAM Entropy", f"{atk_data['cam_entropy']:.3f}")
+                                            st.caption("Attention dispersion")
+                                else:
+                                    st.info("Clean tensor not available for Grad-CAM analysis.")
+                                    
+                            except Exception as e:
+                                st.warning(f"Could not generate Grad-CAM: {e}")
+            
+            # ============================================================
+            # SECTION 5: AGGREGATE RETRAINING GUIDANCE
+            # ============================================================
+            if show_xai:
+                st.divider()
+                st.subheader("🛠️ Aggregate Retraining Guidance")
+                st.caption("Consolidated recommendations based on all tested images")
+                
+                st.write("")  # Spacing
+                
+                # Aggregate all failure types and recommendations across all images
+                all_failure_types = set()
+                all_recommendations = set()
+                has_any_broken = False
+                
+                for r in all_reports:
+                    for atk_name, data in r['attacks'].items():
+                        if data['status'] == "Broken":
+                            has_any_broken = True
+                            failure_types = data.get('failure_types', [])
+                            recommendations = data.get('recommendations', [])
+                            
+                            all_failure_types.update(failure_types)
+                            all_recommendations.update(recommendations)
+                
+                if has_any_broken:
+                    # Display aggregated failure types
+                    if all_failure_types:
+                        st.markdown("**Detected Failure Patterns Across All Images:**")
+                        
+                        # Check for critical failures
+                        has_critical_failure = any(
+                            f in all_failure_types 
+                            for f in ["Attention Drift", "Patch Dominance", "Diffuse Attention"]
+                        )
+                        
+                        failure_text = "\n".join([f"- {ft}" for ft in sorted(all_failure_types)])
+                        
+                        if has_critical_failure:
+                            st.warning(f"**Critical failures detected:**\n\n{failure_text}")
+                        else:
+                            st.info(f"**Detected issues:**\n\n{failure_text}")
+                        
+                        st.write("")  # Spacing
+                    
+                    # Display aggregated recommendations
+                    if all_recommendations:
+                        st.markdown("**Recommended Training Improvements:**")
+                        st.caption("Apply these techniques to improve model robustness")
+                        
+                        for rec in sorted(all_recommendations):
+                            st.markdown(f"✓ {rec}")
+                else:
+                    st.success("**Model Robustness Validated**\n\nThe model shows stable behavior under all tested attacks. No immediate retraining required.")
